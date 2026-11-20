@@ -28,14 +28,14 @@
 Без графического сеанса (сервер по SSH) анлокер сам откроется прямо в
 терминале. Или без архива, одной командой:
 
-    curl -fsSL https://raw.githubusercontent.com/confeden/Antigravity/main/tui.sh | sh
+    curl -fsSL https://github.com/ayne272/Antigravity/releases/latest/download/tui.sh | sh
 
 ## Remote-SSH (`~/.antigravity-server`)
 
 Если вы подключаетесь к этому Linux-серверу из Antigravity IDE по SSH:
 
 1. Сначала откройте SSH-окно хотя бы один раз, чтобы IDE установила серверную часть в `~/.antigravity-server`.
-2. Запустите анлокер на самом сервере (в терминале, без `sudo`) и включите всё — в списке установок появится **Antigravity Remote-SSH**. Анлокер автоматически пропатчит серверный `language_server_*`, добавит загрузку `AG_LS_PROXY` в `~/.bashrc` (до интерактивной проверки), `~/.profile`, `~/.zshenv` и в стартовый скрипт / `out/server-main.js` удалённого сервера, а также оставит локальный прокси и автопатч работать в фоне (через `systemd --user` с `loginctl enable-linger` или как фоновый демон в контейнерах без systemd).
+2. Запустите анлокер на самом сервере (в терминале, без `sudo`) — например, одной командой выше (`curl -fsSL https://github.com/ayne272/Antigravity/releases/latest/download/tui.sh | sh`) или через `ag-unlocker` при повторном запуске — и включите всё: в списке установок появится **Antigravity Remote-SSH**. Анлокер автоматически пропатчит серверный `language_server_*`, добавит загрузку `AG_LS_PROXY` в `~/.bashrc` (до интерактивной проверки), `~/.profile`, `~/.zshenv` и в стартовый скрипт / `out/server-main.js` удалённого сервера, а также оставит локальный прокси и автопатч работать в фоне (через `systemd --user` с `loginctl enable-linger` или как фоновый демон в контейнерах без systemd).
 3. После первого патча переподключите SSH-окно (или выполните команду **«Remote-SSH: Kill VS Code/Antigravity Server on Host»**), чтобы удалённый сервер перезапустился с `AG_LS_PROXY`. При последующих обновлениях удалённого сервера автопатч сам переналожит патчи.
 
 ## Как отключить

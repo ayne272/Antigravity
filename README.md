@@ -25,7 +25,7 @@
 Для сервера по SSH или если окно не открывается. Команда сама берёт последнюю версию.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/confeden/Antigravity/main/tui.sh | sh
+curl -fsSL https://github.com/ayne272/Antigravity/releases/latest/download/tui.sh | sh
 ```
 
 В PowerShell от администратора:

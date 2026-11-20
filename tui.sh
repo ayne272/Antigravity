@@ -1,14 +1,14 @@
 #!/bin/sh
 # Antigravity Unlocker — терминальный режим одной командой (Linux x86-64):
 #
-#   curl -fsSL https://raw.githubusercontent.com/confeden/Antigravity/main/tui.sh | sh
+#   curl -fsSL https://github.com/ayne272/Antigravity/releases/latest/download/tui.sh | sh
 #
 # Берёт последний релиз с GitHub, кладёт программу в
 # ~/.local/share/agunlocker/ и запускает её в этом терминале. Повторный запуск
 # той же командой скачивает заново, только если вышла новая версия. Без root.
 set -eu
 
-REPO="confeden/Antigravity"
+REPO="${AG_REPO:-ayne272/Antigravity}"
 DIR="${XDG_DATA_HOME:-$HOME/.local/share}/agunlocker"
 BIN="$DIR/ag_unlocker"
 
@@ -38,7 +38,8 @@ case "$VER" in
         fi
         ;;
     *)
-        if [ ! -x "$BIN" ] || [ "$(cat "$BIN.version" 2>/dev/null)" != "$VER" ]; then
+        STAMP="$REPO@$VER"
+        if [ "${AG_FORCE_UPDATE:-0}" = "1" ] || [ ! -x "$BIN" ] || [ "$(cat "$BIN.version" 2>/dev/null)" != "$STAMP" ]; then
             echo "Скачиваю Antigravity Unlocker $VER…" >&2
             mkdir -p "$DIR"
             TMP=$(mktemp -d)
@@ -61,7 +62,8 @@ case "$VER" in
                 tar xz -C "$TMP"
             mv -f "$TMP/AG_${NAME}_linux/ag_unlocker" "$BIN"
             chmod +x "$BIN"
-            echo "$VER" >"$BIN.version"
+            mkdir -p "$HOME/.local/bin" 2>/dev/null && ln -sf "$BIN" "$HOME/.local/bin/ag-unlocker" 2>/dev/null || true
+            echo "$STAMP" >"$BIN.version"
             rm -rf "$TMP"
             trap - EXIT
         fi
@@ -70,4 +72,7 @@ esac
 
 # `curl … | sh` hands this script to sh on stdin; the program's keys come from
 # the terminal itself.
+if [ "$#" -gt 0 ]; then
+    exec "$BIN" "$@"
+fi
 exec "$BIN" --tui </dev/tty
