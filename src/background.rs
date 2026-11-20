@@ -593,6 +593,8 @@ mod windows_impl {
 #[cfg(not(target_os = "windows"))]
 mod unix_impl {
     use std::fs;
+    #[cfg(not(target_os = "macos"))]
+    use std::path::Path;
     use std::path::PathBuf;
     #[cfg(not(target_os = "macos"))]
     use std::process::Command;
@@ -641,41 +643,190 @@ mod unix_impl {
             .join(WATCHDOG_UNIT_NAME)
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn systemctl_cmd(args: &[&str]) -> Command {
+        use std::process::Stdio;
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let has_runtime = std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|v| !v.is_empty());
+        if !has_runtime {
+            let uid = unsafe { libc::geteuid() };
+            let runtime = PathBuf::from(format!("/run/user/{uid}"));
+            if runtime.join("bus").exists() {
+                cmd.env("XDG_RUNTIME_DIR", runtime);
+            }
+        }
+        cmd
+    }
+
     /// Runs `systemctl --user ...`; true on success. Best-effort: a machine
-    /// without a user systemd manager (rare on a desktop) just fails the enable.
+    /// without a user systemd manager (e.g. minimal SSH container) falls back
+    /// to a detached daemon.
     #[cfg(not(target_os = "macos"))]
     fn systemctl(args: &[&str]) -> bool {
-        Command::new("systemctl")
-            .arg("--user")
-            .args(args)
+        systemctl_cmd(args)
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
     }
 
-    /// The unit file existing is what "enabled" means here.
+    #[cfg(not(target_os = "macos"))]
+    fn systemctl_available() -> bool {
+        systemctl(&["show-environment"])
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn enable_linger_best_effort() {
+        use std::process::Stdio;
+        let mut cmd = Command::new("loginctl");
+        cmd.arg("enable-linger");
+        if let Ok(user) = std::env::var("USER") {
+            let user = user.trim();
+            if !user.is_empty() {
+                cmd.arg(user);
+            }
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn proxy_pid_path() -> PathBuf {
+        install_dir().join("proxy.pid")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn watchdog_pid_path() -> PathBuf {
+        install_dir().join("watchdog.pid")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn read_pid(pid_path: &Path) -> Option<i32> {
+        fs::read_to_string(pid_path)
+            .ok()?
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|&p| p > 0)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn pid_matches(pid: i32, flag: &str) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return false;
+        }
+        let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let args: Vec<String> = raw
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let exe_name = installed_exe()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ag_proxy".to_string());
+        let has_exe = args
+            .first()
+            .is_some_and(|a| a.contains(&exe_name) || a.contains("ag_proxy"));
+        let has_flag = args.iter().any(|a| a == flag);
+        has_exe && has_flag
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn is_detached_running(pid_path: &Path, flag: &str) -> bool {
+        read_pid(pid_path).is_some_and(|pid| pid_matches(pid, flag))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn stop_detached(pid_path: &Path, flag: &str) {
+        if let Some(pid) = read_pid(pid_path) {
+            if pid_matches(pid, flag) {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                for _ in 0..20 {
+                    if !pid_matches(pid, flag) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if pid_matches(pid, flag) {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(pid_path);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn spawn_detached(flag: &str, pid_path: &Path) -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        stop_detached(pid_path, flag);
+        if let Some(dir) = pid_path.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
+        }
+        let data_home = crate::dns_forwarder::log_dir()
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let mut cmd = Command::new(installed_exe());
+        cmd.arg(flag)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if !data_home.is_empty() {
+            cmd.env("XDG_DATA_HOME", data_home);
+        }
+        // Detach from the SSH PTY session so the service outlives logout.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("не удалось запустить фоновый процесс: {}", e))?;
+        let _ = fs::write(pid_path, child.id().to_string());
+        Ok(())
+    }
+
+    /// The unit file existing (or an active detached daemon) is what "enabled" means here.
     #[cfg(not(target_os = "macos"))]
     pub fn is_enabled() -> bool {
-        unit_path().exists()
+        unit_path().exists() || is_detached_running(&proxy_pid_path(), PROXY_FLAG)
     }
 
     /// The auto-patch watcher is a user unit of its own, beside the proxy's: the
     /// switch must be able to stand without the 400 bypass (it is the whole
     /// reason `ensure_installed` exists), and an update that replaces
     /// `language_server` under a running Antigravity is as real here as on
-    /// Windows. The unit file existing is what "enabled" means, as for the proxy.
+    /// Windows.
     #[cfg(not(target_os = "macos"))]
     pub fn is_watchdog_enabled() -> bool {
-        watchdog_unit_path().exists()
+        watchdog_unit_path().exists() || is_detached_running(&watchdog_pid_path(), WATCHDOG_FLAG)
     }
 
     #[cfg(not(target_os = "macos"))]
     pub fn is_running() -> bool {
-        Command::new("systemctl")
-            .args(["--user", "is-active", "--quiet", UNIT_NAME])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        systemctl(&["is-active", "--quiet", UNIT_NAME])
+            || is_detached_running(&proxy_pid_path(), PROXY_FLAG)
     }
 
     /// No versioned relay on Linux, so nothing to call outdated.
@@ -684,12 +835,21 @@ mod unix_impl {
     }
 
     /// Installs the exe under the XDG data dir, writes a systemd **user** unit that
-    /// runs it with `--proxy`, and starts it. No root: `systemctl --user` targets
-    /// the caller's own session manager, which is why the whole Linux flow runs
-    /// unprivileged (and "Run as a Program" works without a password prompt).
+    /// runs it with `--proxy` (falling back to a detached daemon when systemd
+    /// user manager is unavailable over SSH), and starts it.
     #[cfg(not(target_os = "macos"))]
     pub fn ensure_running() -> Result<(), String> {
         let replaced = install_copy()?;
+        if !systemctl_available() {
+            if replaced || !is_detached_running(&proxy_pid_path(), PROXY_FLAG) {
+                spawn_detached(PROXY_FLAG, &proxy_pid_path())?;
+            }
+            if replaced && is_detached_running(&watchdog_pid_path(), WATCHDOG_FLAG) {
+                let _ = spawn_detached(WATCHDOG_FLAG, &watchdog_pid_path());
+            }
+            return Ok(());
+        }
+        stop_detached(&proxy_pid_path(), PROXY_FLAG);
 
         let up = unit_path();
         if let Some(p) = up.parent() {
@@ -723,6 +883,7 @@ mod unix_impl {
         if replaced && is_watchdog_enabled() {
             systemctl(&["restart", WATCHDOG_UNIT_NAME]);
         }
+        enable_linger_best_effort();
         Ok(())
     }
 
@@ -801,17 +962,33 @@ mod unix_impl {
 
     #[cfg(not(target_os = "macos"))]
     pub fn enable() -> Result<(), String> {
-        ensure_running()?;
-        let _ = systemctl(&["restart", UNIT_NAME]);
+        if systemctl_available() {
+            ensure_running()?;
+            let _ = systemctl(&["restart", UNIT_NAME]);
+            return Ok(());
+        }
+        install_copy()?;
+        spawn_detached(PROXY_FLAG, &proxy_pid_path())?;
+        if is_detached_running(&watchdog_pid_path(), WATCHDOG_FLAG) {
+            let _ = spawn_detached(WATCHDOG_FLAG, &watchdog_pid_path());
+        }
         Ok(())
     }
 
-    /// Writes the watcher's user unit and starts it. Only the file and the unit:
-    /// the proxy unit is not touched, so auto-patch on its own never switches the
+    /// Writes the watcher's user unit and starts it (or a detached daemon when
+    /// systemd user manager is unavailable). Only the file and the unit: the
+    /// proxy unit is not touched, so auto-patch on its own never switches the
     /// 400 bypass on.
     #[cfg(not(target_os = "macos"))]
     pub fn enable_watchdog() -> Result<(), String> {
         let replaced = install_copy()?;
+        if !systemctl_available() {
+            if replaced || !is_detached_running(&watchdog_pid_path(), WATCHDOG_FLAG) {
+                spawn_detached(WATCHDOG_FLAG, &watchdog_pid_path())?;
+            }
+            return Ok(());
+        }
+        stop_detached(&watchdog_pid_path(), WATCHDOG_FLAG);
         let up = watchdog_unit_path();
         if let Some(p) = up.parent() {
             fs::create_dir_all(p).map_err(|e| format!("не создать {}: {}", p.display(), e))?;
@@ -828,6 +1005,7 @@ mod unix_impl {
                 "автопатч записан, но служба не перезапустилась (systemctl --user)".to_string(),
             );
         }
+        enable_linger_best_effort();
         Ok(())
     }
 
@@ -843,6 +1021,11 @@ mod unix_impl {
         systemctl(&["disable", "--now", WATCHDOG_UNIT_NAME]);
         let _ = fs::remove_file(watchdog_unit_path());
         systemctl(&["daemon-reload"]);
+        stop_detached(&watchdog_pid_path(), WATCHDOG_FLAG);
+        if !is_enabled() {
+            let _ = fs::remove_file(installed_exe());
+            let _ = fs::remove_dir(install_dir());
+        }
     }
 
     /// Stops and removes the user unit and the installed copy. Quiet success even
@@ -852,7 +1035,8 @@ mod unix_impl {
         systemctl(&["disable", "--now", UNIT_NAME]);
         let _ = fs::remove_file(unit_path());
         systemctl(&["daemon-reload"]);
-        // The watcher runs the same copy: while its unit is there the file stays.
+        stop_detached(&proxy_pid_path(), PROXY_FLAG);
+        // The watcher runs the same copy: while its unit or daemon is there the file stays.
         if !is_watchdog_enabled() {
             let _ = fs::remove_file(installed_exe());
             let _ = fs::remove_dir(install_dir());

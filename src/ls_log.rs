@@ -395,42 +395,135 @@ fn count_needle(buf: &[u8], needle: &[u8]) -> usize {
 /// walks `%APPDATA%` and then the IDE's `logs` folder, which has one sub-folder
 /// per launch, and a window ticking every three seconds must not do that.
 pub fn candidate_logs() -> Vec<PathBuf> {
-    let Some(root) = profile_root() else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(&root) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    let mut products = 0usize;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.to_ascii_lowercase().starts_with("antigravity") {
-            continue;
-        }
-        products += 1;
-        if products > MAX_PRODUCTS {
-            break;
-        }
-        let logs = entry.path().join("logs");
-        let desktop = logs.join("language_server.log");
-        if desktop.is_file() {
-            out.push(desktop);
-        }
-        if let Some(session) = newest_session(&logs) {
-            let ide = session.join("ls-main.log");
-            if ide.is_file() {
-                out.push(ide);
+    if let Some(root) = profile_root() {
+        if let Ok(entries) = fs::read_dir(&root) {
+            let mut products = 0usize;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.to_ascii_lowercase().starts_with("antigravity") {
+                    continue;
+                }
+                products += 1;
+                if products > MAX_PRODUCTS {
+                    break;
+                }
+                let logs = entry.path().join("logs");
+                let desktop = logs.join("language_server.log");
+                if desktop.is_file() {
+                    out.push(desktop);
+                }
+                if let Some(session) = newest_session(&logs) {
+                    let ide = session.join("ls-main.log");
+                    if ide.is_file() {
+                        out.push(ide);
+                    }
+                }
             }
         }
     }
     for app_dir in CLI_APP_DIRS {
         if let Some(cli) = newest_cli_log(app_dir) {
-            out.push(cli);
+            if !out.contains(&cli) {
+                out.push(cli);
+            }
+        }
+    }
+    for log in remote_server_logs() {
+        if !out.contains(&log) {
+            out.push(log);
         }
     }
     out
+}
+
+fn newest_log_in(dir: &Path, mut filter: impl FnMut(&str) -> bool) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter(|e| {
+            let low = e.file_name().to_string_lossy().to_ascii_lowercase();
+            low.ends_with(".log") && filter(&low)
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .max_by(|(ma, pa), (mb, pb)| ma.cmp(mb).then_with(|| pa.cmp(pb)))
+        .map(|(_, p)| p)
+}
+
+fn remote_server_logs_in(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let push_unique = |list: &mut Vec<PathBuf>, p: PathBuf| {
+        if !list.contains(&p) {
+            list.push(p);
+        }
+    };
+    for dir_name in [".antigravity-server", ".antigravity-server-insiders"] {
+        let logs = home.join(dir_name).join("data").join("logs");
+        let direct = logs.join("language_server.log");
+        if direct.is_file() {
+            push_unique(&mut out, direct);
+        }
+        let Some(session) = newest_session(&logs) else {
+            continue;
+        };
+        for name in ["ls-main.log", "language_server.log"] {
+            let p = session.join(name);
+            if p.is_file() {
+                push_unique(&mut out, p);
+            }
+        }
+        let Ok(entries) = fs::read_dir(&session) else {
+            continue;
+        };
+        for entry in entries
+            .flatten()
+            .filter(|e| {
+                e.path().is_dir()
+                    && e.file_name()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with("exthost")
+            })
+            .take(8)
+        {
+            let exthost = entry.path();
+            if let Some(p) = newest_log_in(&exthost, |low| {
+                low.contains("antigravity")
+                    || low.contains("language_server")
+                    || low.contains("ls-")
+            }) {
+                push_unique(&mut out, p);
+            }
+            if let Ok(sub_entries) = fs::read_dir(&exthost) {
+                for sub in sub_entries.flatten() {
+                    let sub_path = sub.path();
+                    if !sub_path.is_dir() {
+                        continue;
+                    }
+                    let matched = sub
+                        .file_name()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("antigravity");
+                    if matched {
+                        if let Some(p) = newest_log_in(&sub_path, |_| true) {
+                            push_unique(&mut out, p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn remote_server_logs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
+        return Vec::new();
+    };
+    remote_server_logs_in(Path::new(&home))
 }
 
 /// `~/.gemini/<dir>/log` folders the `agy` backend writes `cli-<stamp>.log` to.
@@ -1677,5 +1770,41 @@ API Error: {Reason:UNSUPPORTED_LOCATION}
             overload_model(b"UNAVAILABLE (code 503): The service is currently unavailable."),
             ""
         );
+    }
+
+    #[test]
+    fn discovers_remote_server_logs_in_newest_session() {
+        let root = std::env::temp_dir().join(format!("ag_remote_logs_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let logs = root
+            .join(".antigravity-server")
+            .join("data")
+            .join("logs");
+        let old_session = logs.join("20260101T000000");
+        let new_session = logs.join("20261120T120000");
+        let ext_dir = new_session.join("exthost1").join("google.google-antigravity");
+        fs::create_dir_all(&old_session).unwrap();
+        fs::create_dir_all(&ext_dir).unwrap();
+
+        let old_main = old_session.join("ls-main.log");
+        fs::write(&old_main, b"old\n").unwrap();
+        // Make sure old_session appears older if filesystem timestamp granularity is coarse.
+        let past = std::time::SystemTime::now() - Duration::from_secs(60);
+        if let Ok(f) = fs::File::options().write(true).open(&old_main) {
+            let _ = f.set_modified(past);
+        }
+
+        let new_main = new_session.join("ls-main.log");
+        let ext_log = ext_dir.join("Antigravity.log");
+        fs::write(&new_main, b"new\n").unwrap();
+        fs::write(&ext_log, b"ext\n").unwrap();
+
+        let found = remote_server_logs_in(&root);
+        assert!(found.contains(&new_main), "missing ls-main.log: {:?}", found);
+        assert!(found.contains(&ext_log), "missing exthost Antigravity.log: {:?}", found);
+        assert!(!found.contains(&old_main), "old session should not be picked: {:?}", found);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -627,9 +627,142 @@ fn repatch_with(bin_path: &Path, kill_locked: bool) -> RepatchOutcome {
         write_atomic(bin_path, &data).map_err(|e| e.to_string())
     };
     match written {
-        Ok(()) => RepatchOutcome::Repatched(replaced),
+        Ok(()) => {
+            #[cfg(all(not(target_os = "windows"), not(test)))]
+            if kill_locked {
+                kill_holder(bin_path);
+            }
+            RepatchOutcome::Repatched(replaced)
+        }
         Err(e) => RepatchOutcome::Failed(e),
     }
+}
+
+/// Scans `dir` for `language_server*` binaries, ignoring patch temps.
+fn push_ls_in_dir(dir: &Path, targets: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Never a patch temp: `language_server_linux_x64.<pid>.agtmp`
+            // matches the prefix for the second or so it exists.
+            let is_ls = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("language_server") && !n.ends_with(TEMP_SUFFIX));
+            if is_ls && path.is_file() && !targets.contains(&path) {
+                targets.push(path);
+            }
+        }
+    }
+}
+
+fn is_antigravity_ext_dir_name(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low == "antigravity"
+        || low.starts_with("antigravity-")
+        || low.starts_with("google.google-antigravity-")
+}
+
+fn push_agy_from_gemini_bin(targets: &mut Vec<PathBuf>) {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    if let Some(bin) = home.map(|h| h.join(".gemini").join("bin")) {
+        for name in ["agy.exe", "agy"] {
+            let p = bin.join(name);
+            if !targets.contains(&p) {
+                targets.push(p);
+            }
+        }
+    }
+}
+
+fn scan_extensions_bin(ext_root: &Path, targets: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(ext_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let matched = path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_antigravity_ext_dir_name);
+            if matched {
+                push_ls_in_dir(&path.join("bin"), targets);
+            }
+        }
+    }
+}
+
+/// Server commit directories inside a Remote-SSH install root (either a single
+/// commit dir itself, or a `~/.antigravity-server` container).
+pub fn remote_server_dirs(inst: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let push_unique = |list: &mut Vec<PathBuf>, p: PathBuf| {
+        if !list.contains(&p) {
+            list.push(p);
+        }
+    };
+
+    if inst.join("out").join("server-main.js").is_file()
+        || inst.join("bin").join("antigravity-server").is_file()
+        || inst.join("bin").join("antigravity-server-insiders").is_file()
+        || inst.join("extensions").join("antigravity").is_dir()
+    {
+        push_unique(&mut dirs, inst.to_path_buf());
+    }
+
+    if let Ok(entries) = fs::read_dir(inst.join("bin")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                push_unique(&mut dirs, p);
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(inst.join("cli").join("servers")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let candidate = if p.join("server").is_dir() {
+                p.join("server")
+            } else {
+                p
+            };
+            push_unique(&mut dirs, candidate);
+        }
+    }
+
+    dirs
+}
+
+fn collect_remote_binaries(inst: &Path, targets: &mut Vec<PathBuf>) {
+    for srv in remote_server_dirs(inst) {
+        push_ls_in_dir(&srv.join("extensions").join("antigravity").join("bin"), targets);
+        push_ls_in_dir(&srv.join("bin"), targets);
+        push_ls_in_dir(&srv.join("resources").join("bin"), targets);
+        push_ls_in_dir(
+            &srv.join("resources")
+                .join("app")
+                .join("extensions")
+                .join("antigravity")
+                .join("bin"),
+            targets,
+        );
+        scan_extensions_bin(&srv.join("extensions"), targets);
+        if srv.join("extensions").join("agy").is_dir() {
+            push_agy_from_gemini_bin(targets);
+        }
+    }
+    scan_extensions_bin(&inst.join("extensions"), targets);
+}
+
+pub fn has_remote_binaries(inst: &Path) -> bool {
+    let mut targets = Vec::new();
+    collect_remote_binaries(inst, &mut targets);
+    targets.into_iter().any(|p| p.exists())
 }
 
 /// Native binaries that carry the eligibility check, for a given install root.
@@ -670,20 +803,7 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
     // platform-suffixed names (`language_server_linux_x64`, `..._darwin_arm64`, …)
     // without pinning the exact spelling.
     for dir in [&ext_bin, &resources_bin] {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                // Never a patch temp: `language_server_linux_x64.<pid>.agtmp`
-                // matches the prefix for the second or so it exists.
-                let is_ls = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("language_server") && !n.ends_with(TEMP_SUFFIX));
-                if is_ls && path.is_file() && !targets.contains(&path) {
-                    targets.push(path);
-                }
-            }
-        }
+        push_ls_in_dir(dir, &mut targets);
     }
 
     // IDE 2.6.0 carries no language server of its own: its `agy` extension
@@ -695,17 +815,11 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         .join("agy")
         .is_dir()
     {
-        let home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(PathBuf::from);
-        if let Some(bin) = home.map(|h| h.join(".gemini").join("bin")) {
-            for name in ["agy.exe", "agy"] {
-                let p = bin.join(name);
-                if !targets.contains(&p) {
-                    targets.push(p);
-                }
-            }
-        }
+        push_agy_from_gemini_bin(&mut targets);
+    }
+
+    if crate::is_remote_server_install(inst) {
+        collect_remote_binaries(inst, &mut targets);
     }
 
     targets.retain(|p| p.exists());
@@ -1528,5 +1642,62 @@ mod owner_app_tests {
         assert_eq!(owner_app(&agy), None);
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&lone).ok();
+    }
+
+    #[test]
+    fn remote_server_binary_targets_cover_bin_and_cli_layouts_and_ignore_agtmp() {
+        let root = std::env::temp_dir().join(format!("ag_remote_bins_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let server_root = root.join(".antigravity-server");
+
+        let commit_bin = server_root
+            .join("bin")
+            .join("abc123")
+            .join("extensions")
+            .join("antigravity")
+            .join("bin");
+        fs::create_dir_all(&commit_bin).unwrap();
+        let ls1 = commit_bin.join("language_server_linux_x64");
+        fs::write(&ls1, b"..ineligible..https_proxy..").unwrap();
+        let tmp_file = commit_bin.join("language_server_linux_x64.999.agtmp");
+        fs::write(&tmp_file, b"partial").unwrap();
+
+        let cli_bin = server_root
+            .join("cli")
+            .join("servers")
+            .join("Stable-def456")
+            .join("server")
+            .join("extensions")
+            .join("antigravity")
+            .join("bin");
+        fs::create_dir_all(&cli_bin).unwrap();
+        let ls2 = cli_bin.join("language_server_linux_arm64");
+        fs::write(&ls2, b"..ineligible..https_proxy..").unwrap();
+
+        let found = binary_targets(&server_root);
+        let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let found_canon: Vec<PathBuf> = found.iter().map(|p| canon(p)).collect();
+        assert!(found_canon.contains(&canon(&ls1)), "missing ls1: {:?}", found);
+        assert!(found_canon.contains(&canon(&ls2)), "missing ls2: {:?}", found);
+        assert!(
+            !found_canon.contains(&canon(&tmp_file)),
+            "agtmp must be ignored: {:?}",
+            found
+        );
+
+        let summary = patch_all_binaries(&server_root);
+        assert_eq!(summary.ok, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.proxy_var, 2);
+        assert_eq!(fs::read(&ls1).unwrap(), b"..inexigible..AG_LS_PROXY..");
+        assert_eq!(fs::read(&ls2).unwrap(), b"..inexigible..AG_LS_PROXY..");
+
+        for (_, res) in unpatch_all_binaries(&server_root) {
+            assert!(res.is_ok());
+        }
+        assert_eq!(fs::read(&ls1).unwrap(), b"..ineligible..https_proxy..");
+        assert_eq!(fs::read(&ls2).unwrap(), b"..ineligible..https_proxy..");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

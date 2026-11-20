@@ -47,6 +47,14 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o644);
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
+    }
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -685,4 +693,383 @@ pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
     backup_once(&ext_path);
     write_atomic(&ext_path, &marked).map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+const REMOTE_SH_BEGIN: &str = "# >>> ag-unlocker >>>";
+const REMOTE_SH_END: &str = "# <<< ag-unlocker <<<";
+const REMOTE_SH_HOOK: &str = "\
+# >>> ag-unlocker >>>
+_ag_c=\"${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/ag-unlocker.conf\"
+if [ -r \"$_ag_c\" ]; then set -a; . \"$_ag_c\"; set +a; fi
+# <<< ag-unlocker <<<";
+
+const REMOTE_JS_BEGIN: &str = "/* [AG_ENV_HOOK] */";
+const REMOTE_JS_END: &str = "/* [/AG_ENV_HOOK] */";
+const REMOTE_JS_CJS_HOOK: &str = "\
+/* [AG_ENV_HOOK] */
+(()=>{try{const _f=require(\"fs\"),_o=require(\"os\"),_p=require(\"path\"),_b=process.env.XDG_CONFIG_HOME||_p.join(_o.homedir(),\".config\"),_c=_p.join(_b,\"environment.d\",\"ag-unlocker.conf\");if(_f.existsSync(_c)){for(const _l of _f.readFileSync(_c,\"utf8\").split(/\\r?\\n/)){const _t=_l.trim();if(!_t||_t.startsWith(\"#\"))continue;const _i=_t.indexOf(\"=\");if(_i>0&&_t.slice(0,_i).trim()===\"AG_LS_PROXY\"){const _v=_t.slice(_i+1).trim().replace(/^['\"]|['\"]$/g,\"\");if(_v)process.env.AG_LS_PROXY=_v;}}}}catch(_){}})();
+/* [/AG_ENV_HOOK] */";
+
+const REMOTE_JS_ESM_HOOK: &str = "\
+/* [AG_ENV_HOOK] */
+import * as __agFs from \"node:fs\";
+import * as __agOs from \"node:os\";
+import * as __agPath from \"node:path\";
+try{const _b=process.env.XDG_CONFIG_HOME||__agPath.join(__agOs.homedir(),\".config\"),_c=__agPath.join(_b,\"environment.d\",\"ag-unlocker.conf\");if(__agFs.existsSync(_c)){for(const _l of __agFs.readFileSync(_c,\"utf8\").split(/\\r?\\n/)){const _t=_l.trim();if(!_t||_t.startsWith(\"#\"))continue;const _i=_t.indexOf(\"=\");if(_i>0&&_t.slice(0,_i).trim()===\"AG_LS_PROXY\"){const _v=_t.slice(_i+1).trim().replace(/^['\"]|['\"]$/g,\"\");if(_v)process.env.AG_LS_PROXY=_v;}}}}catch(_){}
+/* [/AG_ENV_HOOK] */";
+
+fn is_posix_shell_script(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 256];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    let head = &buf[..n];
+    if !head.starts_with(b"#!") {
+        return false;
+    }
+    let first_line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let first_line = String::from_utf8_lossy(&head[..first_line_end]).to_ascii_lowercase();
+    first_line.contains("sh")
+        && !first_line.contains("node")
+        && !first_line.contains("python")
+        && !first_line.contains("perl")
+        && !first_line.contains("ruby")
+}
+
+fn first_js_statement(mut s: &str) -> &str {
+    if s.starts_with("#!") {
+        match s.find('\n') {
+            Some(nl) => s = &s[nl + 1..],
+            None => return "",
+        }
+    }
+    loop {
+        s = s.trim_start();
+        if s.starts_with("//") {
+            match s.find('\n') {
+                Some(nl) => s = &s[nl + 1..],
+                None => return "",
+            }
+        } else if s.starts_with("/*") {
+            match s.find("*/") {
+                Some(end) => s = &s[end + 2..],
+                None => return "",
+            }
+        } else {
+            return s;
+        }
+    }
+}
+
+fn is_esm_server_main(path: &Path, content: &str) -> bool {
+    if let Some(pkg) = path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|r| r.join("package.json"))
+    {
+        if let Ok(text) = fs::read_to_string(pkg) {
+            if let Ok(re) = Regex::new(r#""type"\s*:\s*"module""#) {
+                if re.is_match(&text) {
+                    return true;
+                }
+            }
+        }
+    }
+    let stmt = first_js_statement(content);
+    stmt.starts_with("import ")
+        || stmt.starts_with("import{")
+        || stmt.starts_with("import*")
+        || stmt.starts_with("import\"")
+        || stmt.starts_with("import'")
+}
+
+fn insert_after_shebang_and_strict(content: &str, hook: &str, keep_strict: bool) -> String {
+    let mut pos = 0usize;
+    if content.starts_with("#!") {
+        pos = content.find('\n').map_or(content.len(), |nl| nl + 1);
+    }
+    if keep_strict && pos < content.len() {
+        let rest = &content[pos..];
+        let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        let lead = rest.len() - trimmed.len();
+        for lit in ["\"use strict\";", "'use strict';"] {
+            if let Some(after) = trimmed.strip_prefix(lit) {
+                let eol = if after.starts_with("\r\n") {
+                    2
+                } else if after.starts_with('\n') {
+                    1
+                } else {
+                    0
+                };
+                pos += lead + lit.len() + eol;
+                break;
+            }
+        }
+        if pos == content.len() - rest.len() {
+            for bare in ["\"use strict\"\r\n", "'use strict'\r\n", "\"use strict\"\n", "'use strict'\n"] {
+                if trimmed.starts_with(bare) {
+                    pos += lead + bare.len();
+                    break;
+                }
+            }
+        }
+    }
+    let prefix = &content[..pos];
+    let suffix = &content[pos..];
+    if !prefix.is_empty() && !prefix.ends_with('\n') {
+        if pos == content.len() {
+            return format!("{prefix}\n{hook}\n");
+        }
+        return format!("{prefix}{hook}\n{suffix}");
+    }
+    format!("{prefix}{hook}\n{suffix}")
+}
+
+fn strip_fenced_block(content: &str, begin: &str, end: &str) -> Option<String> {
+    let b = content.find(begin)?;
+    let e_rel = content[b..].find(end)?;
+    let mut after = b + e_rel + end.len();
+    if content[after..].starts_with("\r\n") {
+        after += 2;
+    } else if content[after..].starts_with('\n') {
+        after += 1;
+    }
+    Some(format!("{}{}", &content[..b], &content[after..]))
+}
+
+pub fn remote_env_targets(inst: &Path) -> Vec<PathBuf> {
+    if !crate::is_remote_server_install(inst) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let push_unique = |list: &mut Vec<PathBuf>, p: PathBuf| {
+        if !list.contains(&p) {
+            list.push(p);
+        }
+    };
+    for srv in crate::patch_binary::remote_server_dirs(inst) {
+        for cand in [
+            srv.join("bin").join("antigravity-server"),
+            srv.join("bin").join("antigravity-server-insiders"),
+            srv.join("bin").join("code-server"),
+            srv.join("server.sh"),
+        ] {
+            if cand.is_file() && is_posix_shell_script(&cand) {
+                push_unique(&mut out, cand);
+            }
+        }
+        let server_main = srv.join("out").join("server-main.js");
+        if server_main.is_file() {
+            push_unique(&mut out, server_main);
+        }
+    }
+    out
+}
+
+pub fn is_remote_env_target(path: &Path) -> bool {
+    let is_server_main = path.file_name().is_some_and(|n| n == "server-main.js")
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "out");
+    if is_server_main {
+        return true;
+    }
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        matches!(
+            n,
+            "antigravity-server" | "antigravity-server-insiders" | "code-server" | "server.sh"
+        )
+    })
+}
+
+pub fn repatch_remote_env_file(target: &Path) -> RepatchOutcome {
+    let is_js = target.extension().and_then(|e| e.to_str()) == Some("js");
+    if !is_js && !is_posix_shell_script(target) {
+        return RepatchOutcome::AlreadyPatched;
+    }
+    let content = match fs::read_to_string(target) {
+        Ok(c) => c,
+        Err(e) => return RepatchOutcome::Failed(e.to_string()),
+    };
+    if is_js {
+        if content.contains(REMOTE_JS_BEGIN) {
+            return RepatchOutcome::AlreadyPatched;
+        }
+        let esm = is_esm_server_main(target, &content);
+        let hook = if esm {
+            REMOTE_JS_ESM_HOOK
+        } else {
+            REMOTE_JS_CJS_HOOK
+        };
+        let updated = insert_after_shebang_and_strict(&content, hook, !esm);
+        return match write_atomic(target, &updated) {
+            Ok(()) => RepatchOutcome::Repatched(1),
+            Err(e) => RepatchOutcome::Failed(e.to_string()),
+        };
+    }
+    if content.contains(REMOTE_SH_BEGIN) {
+        return RepatchOutcome::AlreadyPatched;
+    }
+    let updated = insert_after_shebang_and_strict(&content, REMOTE_SH_HOOK, false);
+    match write_atomic(target, &updated) {
+        Ok(()) => RepatchOutcome::Repatched(1),
+        Err(e) => RepatchOutcome::Failed(e.to_string()),
+    }
+}
+
+pub fn patch_remote_server_env(inst: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for target in remote_env_targets(inst) {
+        if let RepatchOutcome::Failed(e) = repatch_remote_env_file(&target) {
+            let name = target.file_name().unwrap_or_default().to_string_lossy();
+            warnings.push(format!("{}: {}", name, e));
+        }
+    }
+    warnings
+}
+
+pub fn unpatch_remote_server_env(inst: &Path) -> Vec<(String, Result<bool, String>)> {
+    let mut out = Vec::new();
+    for target in remote_env_targets(inst) {
+        let label = target
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let is_js = target.extension().and_then(|e| e.to_str()) == Some("js");
+        let content = match fs::read_to_string(&target) {
+            Ok(c) => c,
+            Err(e) => {
+                out.push((label, Err(e.to_string())));
+                continue;
+            }
+        };
+        let (begin, end) = if is_js {
+            (REMOTE_JS_BEGIN, REMOTE_JS_END)
+        } else {
+            (REMOTE_SH_BEGIN, REMOTE_SH_END)
+        };
+        match strip_fenced_block(&content, begin, end) {
+            Some(stripped) => {
+                let res = write_atomic(&target, &stripped)
+                    .map(|()| true)
+                    .map_err(|e| format!("не записать {}: {}", target.display(), e));
+                out.push((label, res));
+            }
+            None => out.push((label, Ok(false))),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod remote_env_tests {
+    use super::*;
+
+    #[test]
+    fn shell_launcher_patches_idempotently_and_reverts_byte_exactly() {
+        let root = std::env::temp_dir().join(format!("ag_remote_sh_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let commit = root.join(".antigravity-server").join("bin").join("c1");
+        let bin = commit.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let sh = bin.join("antigravity-server");
+        let orig = "#!/usr/bin/env sh\nset -e\nexec node out/server-main.js \"$@\"\n";
+        fs::write(&sh, orig).unwrap();
+
+        let targets = remote_env_targets(&root.join(".antigravity-server"));
+        assert_eq!(targets, vec![sh.clone()]);
+        assert!(is_remote_env_target(&sh));
+
+        assert_eq!(repatch_remote_env_file(&sh), RepatchOutcome::Repatched(1));
+        let patched = fs::read_to_string(&sh).unwrap();
+        assert!(patched.starts_with("#!/usr/bin/env sh\n# >>> ag-unlocker >>>\n"));
+        assert!(patched.contains("exec node out/server-main.js"));
+        assert_eq!(repatch_remote_env_file(&sh), RepatchOutcome::AlreadyPatched);
+
+        let rev = unpatch_remote_server_env(&root.join(".antigravity-server"));
+        assert_eq!(rev.len(), 1);
+        assert_eq!(rev[0].1, Ok(true));
+        assert_eq!(fs::read_to_string(&sh).unwrap(), orig);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn elf_binary_named_antigravity_server_is_skipped_and_untouched() {
+        let root = std::env::temp_dir().join(format!("ag_remote_elf_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let bin = root
+            .join(".antigravity-server")
+            .join("bin")
+            .join("c1")
+            .join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let elf = bin.join("antigravity-server");
+        let orig = b"\x7fELF\x02\x01\x01\x00binary";
+        fs::write(&elf, orig).unwrap();
+
+        assert!(remote_env_targets(&root.join(".antigravity-server")).is_empty());
+        assert_eq!(
+            repatch_remote_env_file(&elf),
+            RepatchOutcome::AlreadyPatched
+        );
+        assert_eq!(fs::read(&elf).unwrap(), orig);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cjs_server_main_patches_after_use_strict_and_reverts_byte_exactly() {
+        let root = std::env::temp_dir().join(format!("ag_remote_cjs_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let srv = root.join(".antigravity-server").join("bin").join("c1");
+        let out_dir = srv.join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let js = out_dir.join("server-main.js");
+        let orig = "\"use strict\";\nconst net = require(\"net\");\n";
+        fs::write(&js, orig).unwrap();
+
+        assert!(is_remote_env_target(&js));
+        assert_eq!(repatch_remote_env_file(&js), RepatchOutcome::Repatched(1));
+        let patched = fs::read_to_string(&js).unwrap();
+        assert!(patched.starts_with("\"use strict\";\n/* [AG_ENV_HOOK] */\n"));
+        assert!(patched.contains("require(\"fs\")"));
+        assert_eq!(repatch_remote_env_file(&js), RepatchOutcome::AlreadyPatched);
+
+        let rev = unpatch_remote_server_env(&root.join(".antigravity-server"));
+        assert_eq!(rev, vec![("server-main.js".to_string(), Ok(true))]);
+        assert_eq!(fs::read_to_string(&js).unwrap(), orig);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn esm_server_main_uses_import_hook_and_reverts_byte_exactly() {
+        let root = std::env::temp_dir().join(format!("ag_remote_esm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let srv = root.join(".antigravity-server").join("bin").join("c1");
+        let out_dir = srv.join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(srv.join("package.json"), r#"{"type": "module"}"#).unwrap();
+        let js = out_dir.join("server-main.js");
+        let orig = "import http from \"node:http\";\n";
+        fs::write(&js, orig).unwrap();
+
+        assert_eq!(repatch_remote_env_file(&js), RepatchOutcome::Repatched(1));
+        let patched = fs::read_to_string(&js).unwrap();
+        assert!(patched.starts_with("/* [AG_ENV_HOOK] */\nimport * as __agFs"));
+        assert_eq!(repatch_remote_env_file(&js), RepatchOutcome::AlreadyPatched);
+
+        let rev = unpatch_remote_server_env(&root.join(".antigravity-server"));
+        assert_eq!(rev, vec![("server-main.js".to_string(), Ok(true))]);
+        assert_eq!(fs::read_to_string(&js).unwrap(), orig);
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

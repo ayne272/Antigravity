@@ -56,6 +56,13 @@ pub fn revert_files(inst: &Path) -> Reverted {
             Err(e) => out.errors.push(format!("{label}: {e}")),
         }
     }
+    for (label, res) in crate::patch_ide::unpatch_remote_server_env(inst) {
+        match res {
+            Ok(true) => out.files += 1,
+            Ok(false) => {}
+            Err(e) => out.errors.push(format!("{label}: {e}")),
+        }
+    }
     if let Err(e) = crate::restore_pristine_asar(&inst.join("resources")) {
         out.warnings.push(format!("app.asar не восстановлен: {e}"));
     }
@@ -101,6 +108,11 @@ fn written_dirs(inst: &Path) -> Vec<PathBuf> {
         app.join("dist").join("main.js"),
     ] {
         if let Some(dir) = js.parent().filter(|_| js.is_file()) {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    for t in crate::patch_ide::remote_env_targets(inst) {
+        if let Some(dir) = t.parent() {
             dirs.push(dir.to_path_buf());
         }
     }

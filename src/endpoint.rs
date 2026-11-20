@@ -304,6 +304,27 @@ fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (b
     (drop_proxy, drop_proxy && no_proxy == Some(NO_PROXY_VALUE))
 }
 
+/// Creates a `systemctl --user` command with silenced stdio/stderr so headless
+/// SSH sessions without a user D-Bus never print errors onto the TUI.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn systemctl_user(args: &[&str]) -> std::process::Command {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("--user")
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    let has_runtime = std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|v| !v.is_empty());
+    if !has_runtime {
+        let uid = unsafe { libc::geteuid() };
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        if runtime.join("bus").exists() {
+            cmd.env("XDG_RUNTIME_DIR", runtime);
+        }
+    }
+    cmd
+}
+
 /// Linux keeps the persistent half in the drop-in file, which `apply_proxy`
 /// rewrites in place - so upgrading drops the old names from the next session by
 /// itself. What survives is the *running* user manager, which an older build
@@ -315,11 +336,8 @@ fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (b
 /// our business.
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
-    use std::process::Command;
-    let Ok(out) = Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .output()
-    else {
+    use std::process::Stdio;
+    let Ok(out) = systemctl_user(&["show-environment"]).output() else {
         return Ok(false);
     };
     let env = String::from_utf8_lossy(&out.stdout);
@@ -352,8 +370,8 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
         }
         // `.success()`, not `.is_ok()`: the latter is true for any process that
         // merely started, so a failed unset would be reported as a removal.
-        if Command::new("systemctl")
-            .args(["--user", "unset-environment", name])
+        if systemctl_user(&["unset-environment", name])
+            .stdout(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -378,7 +396,7 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
 /// file in place is also what retires the old names on an upgrade.
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
-    use std::process::Command;
+    use std::process::Stdio;
     let path = environment_d_path()?;
     let body = format!(
         "# Antigravity Unlocker — гейт-хосты через локальный прокси. Переменную\n\
@@ -405,18 +423,17 @@ pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
         fs::write(&path, &body).map_err(|e| format!("не записать {}: {}", path.display(), e))?;
     }
     // Immediate effect for newly-launched apps in this session (best-effort).
-    Command::new("systemctl")
-        .args([
-            "--user",
-            "set-environment",
-            &format!("{}={}", PROXY_ENV_VAR, url),
-        ])
+    let assign = format!("{}={}", PROXY_ENV_VAR, url);
+    systemctl_user(&["set-environment", &assign])
+        .stdout(Stdio::null())
         .status()
         .ok();
     Ok(Outcome::Applied)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 const SHELL_BEGIN: &str = "# >>> ag-unlocker >>>";
+#[cfg_attr(not(test), allow(dead_code))]
 const SHELL_END: &str = "# <<< ag-unlocker <<<";
 
 /// The block put into a shell startup file: it sources the same `KEY=value`
@@ -425,45 +442,71 @@ const SHELL_END: &str = "# <<< ag-unlocker <<<";
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn shell_block(conf: &Path) -> String {
     format!(
-        "{SHELL_BEGIN}\n[ -r '{p}' ] && {{ set -a; . '{p}'; set +a; }}\n{SHELL_END}\n",
+        "{SHELL_BEGIN}\nif [ -r '{p}' ]; then set -a; . '{p}'; set +a; fi\n{SHELL_END}\n",
         p = conf.display()
     )
 }
 
 /// `text` with our block replaced by `block` (or removed when `block` is None).
 /// Returns None when nothing would change.
-fn rewrite_shell_block(text: &str, block: Option<&str>) -> Option<String> {
-    let out = match (text.find(SHELL_BEGIN), text.find(SHELL_END)) {
+#[cfg_attr(not(test), allow(dead_code))]
+fn rewrite_shell_block_at(text: &str, block: Option<&str>, prepend: bool) -> Option<String> {
+    let cleaned = match (text.find(SHELL_BEGIN), text.find(SHELL_END)) {
         (Some(b), Some(e)) if e > b => {
             let end = e + SHELL_END.len();
-            let end = if text[end..].starts_with('\n') {
+            let end = if text[end..].starts_with("\r\n") {
+                end + 2
+            } else if text[end..].starts_with('\n') {
                 end + 1
             } else {
                 end
             };
-            format!("{}{}{}", &text[..b], block.unwrap_or(""), &text[end..])
+            format!("{}{}", &text[..b], &text[end..])
         }
-        _ => match block {
-            Some(blk) => {
-                let sep = if text.is_empty() || text.ends_with('\n') {
-                    ""
-                } else {
-                    "\n"
-                };
-                format!("{text}{sep}{blk}")
+        _ => text.to_string(),
+    };
+    let out = match block {
+        None => cleaned,
+        Some(blk) if prepend => {
+            if cleaned.starts_with("#!") {
+                match cleaned.find('\n') {
+                    Some(nl) => format!("{}{}{}", &cleaned[..=nl], blk, &cleaned[nl + 1..]),
+                    None => format!("{cleaned}\n{blk}"),
+                }
+            } else {
+                format!("{blk}{cleaned}")
             }
-            None => return None,
-        },
+        }
+        Some(blk) => {
+            let sep = if cleaned.is_empty() || cleaned.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            format!("{cleaned}{sep}{blk}")
+        }
     };
     (out != text).then_some(out)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn rewrite_shell_block(text: &str, block: Option<&str>) -> Option<String> {
+    rewrite_shell_block_at(text, block, false)
+}
+
 /// Shell files that reach what `environment.d` does not: `~/.profile` (lightdm
-/// and login shells) and `~/.bashrc` (a terminal's non-login shell). `.profile`
-/// is created when missing; `.bashrc` only edited if the user has one.
+/// and login shells), `~/.bashrc` (prepended before interactive-only early
+/// returns so SSH non-interactive bash still sees it), and `~/.zshenv` for zsh.
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-fn shell_files(home: &Path) -> [(PathBuf, bool); 2] {
-    [(home.join(".profile"), true), (home.join(".bashrc"), false)]
+fn shell_files(home: &Path) -> Vec<(PathBuf, bool, bool)> {
+    let zsh_present = home.join(".zshenv").exists()
+        || home.join(".zshrc").exists()
+        || std::env::var("SHELL").is_ok_and(|s| s.ends_with("/zsh") || s == "zsh");
+    vec![
+        (home.join(".profile"), true, false),
+        (home.join(".bashrc"), false, true),
+        (home.join(".zshenv"), zsh_present, false),
+    ]
 }
 
 /// True when any file was changed.
@@ -474,13 +517,13 @@ fn ensure_shell_hooks(conf: &Path) -> bool {
     };
     let block = shell_block(conf);
     let mut changed = false;
-    for (file, create) in shell_files(&home) {
+    for (file, create, prepend) in shell_files(&home) {
         let text = match fs::read_to_string(&file) {
             Ok(t) => t,
             Err(_) if create && !file.exists() => String::new(),
             Err(_) => continue,
         };
-        if let Some(new) = rewrite_shell_block(&text, Some(&block)) {
+        if let Some(new) = rewrite_shell_block_at(&text, Some(&block), prepend) {
             changed |= fs::write(&file, new).is_ok();
         }
     }
@@ -493,9 +536,9 @@ fn remove_shell_hooks() {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return;
     };
-    for (file, _) in shell_files(&home) {
+    for (file, _, _) in shell_files(&home) {
         if let Ok(text) = fs::read_to_string(&file) {
-            if let Some(new) = rewrite_shell_block(&text, None) {
+            if let Some(new) = rewrite_shell_block_at(&text, None, false) {
                 let _ = fs::write(&file, new);
             }
         }
@@ -555,7 +598,7 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
 /// proxy the user set another way survives the revert.
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
-    use std::process::Command;
+    use std::process::Stdio;
     remove_shell_hooks();
     if let Ok(path) = environment_d_path() {
         if fs::remove_file(&path).is_ok() {
@@ -563,14 +606,14 @@ pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
             // generator loaded at the last reload survives `unset-environment`,
             // so every program started afterwards still got the address of a
             // proxy that is gone. A reload re-reads environment.d without our file.
-            Command::new("systemctl")
-                .args(["--user", "daemon-reload"])
+            systemctl_user(&["daemon-reload"])
+                .stdout(Stdio::null())
                 .status()
                 .ok();
         }
     }
-    Command::new("systemctl")
-        .args(["--user", "unset-environment", PROXY_ENV_VAR])
+    systemctl_user(&["unset-environment", PROXY_ENV_VAR])
+        .stdout(Stdio::null())
         .status()
         .ok();
     remove_legacy_proxy_env(url).ok();
@@ -707,11 +750,7 @@ pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
 /// and what every app launched from the desktop inherits.
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
-    use std::process::Command;
-    let out = Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .output()
-        .ok()?;
+    let out = systemctl_user(&["show-environment"]).output().ok()?;
     let env = String::from_utf8_lossy(&out.stdout);
     for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
         let prefix = format!("{}=", name);
@@ -737,30 +776,54 @@ fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
 /// and the Desktop app - which ships no loose `product.json` for
 /// `ide_settings_path` to read - are both covered.
 fn antigravity_proxy_setting(ours: &str) -> Option<ForeignProxy> {
-    let root = profile_root()?;
-    let entries = fs::read_dir(&root).ok()?;
-    for entry in entries.flatten().take(64) {
-        let name = entry.file_name();
-        if !name
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with("antigravity")
-        {
-            continue;
+    if let Some(root) = profile_root() {
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten().take(64) {
+                let name = entry.file_name();
+                if !name
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with("antigravity")
+                {
+                    continue;
+                }
+                let path = entry.path().join("User").join("settings.json");
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                if let Some(value) = proxy_setting_in(&text) {
+                    if !is_ours_on_any_port(&value, ours) {
+                        return Some(ForeignProxy {
+                            value,
+                            found_in: format!(
+                                "http.proxy в {}",
+                                crate::utils::mask_path(&path.to_string_lossy())
+                            ),
+                        });
+                    }
+                }
+            }
         }
-        let path = entry.path().join("User").join("settings.json");
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(value) = proxy_setting_in(&text) {
-            if !is_ours_on_any_port(&value, ours) {
-                return Some(ForeignProxy {
-                    value,
-                    found_in: format!(
-                        "http.proxy в {}",
-                        crate::utils::mask_path(&path.to_string_lossy())
-                    ),
-                });
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for dir_name in [".antigravity-server", ".antigravity-server-insiders"] {
+            let path = home
+                .join(dir_name)
+                .join("data")
+                .join("Machine")
+                .join("settings.json");
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Some(value) = proxy_setting_in(&text) {
+                    if !is_ours_on_any_port(&value, ours) {
+                        return Some(ForeignProxy {
+                            value,
+                            found_in: format!(
+                                "http.proxy в {}",
+                                crate::utils::mask_path(&path.to_string_lossy())
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -831,8 +894,13 @@ pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
         return Ok(Outcome::AlreadySet);
     }
     if current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, ours)) {
+        // On Linux, re-run `apply_proxy` (idempotent) so upgrades migrate an
+        // existing `.bashrc` hook to the top and add `.zshenv` if needed.
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        return apply_proxy(ours, "");
         // Still ours and still current - but an old user-wide pair may be sitting
         // beside it, and this path is the one a rebooted machine takes.
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         return match remove_legacy_proxy_env(ours) {
             Ok(true) => Ok(Outcome::Applied),
             _ => Ok(Outcome::AlreadySet),
@@ -969,10 +1037,7 @@ fn current_env(name: &str) -> Option<String> {
             return Some(trimmed);
         }
     }
-    if let Ok(out) = std::process::Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .output()
-    {
+    if let Ok(out) = systemctl_user(&["show-environment"]).output() {
         let env_str = String::from_utf8_lossy(&out.stdout);
         let prefix = format!("{}=", name);
         if let Some(val) = env_str.lines().find_map(|l| l.strip_prefix(&prefix)) {
@@ -1048,6 +1113,39 @@ mod tests {
         let removed = rewrite_shell_block(&added, None).unwrap();
         assert_eq!(removed, format!("{user}\n"));
         assert_eq!(rewrite_shell_block("", None), None);
+    }
+
+    #[test]
+    fn bashrc_block_prepends_before_interactive_guard_and_migrates() {
+        let block = format!(
+            "{SHELL_BEGIN}\nif [ -r ~/.config/environment.d/ag-unlocker.conf ]; then set -a; . ~/.config/environment.d/ag-unlocker.conf; set +a; fi\n{SHELL_END}\n"
+        );
+        let ubuntu_bashrc = "# ~/.bashrc\ncase $- in\n    *i*) ;;\n      *) return;;\nesac\nexport PATH=\"$HOME/bin:$PATH\"\n";
+
+        let added = rewrite_shell_block_at(ubuntu_bashrc, Some(&block), true).unwrap();
+        assert!(added.starts_with(SHELL_BEGIN));
+        assert!(added.find(SHELL_END).unwrap() < added.find("case $- in").unwrap());
+        assert_eq!(
+            rewrite_shell_block_at(&added, Some(&block), true),
+            None,
+            "idempotent on second run"
+        );
+        assert_eq!(
+            rewrite_shell_block_at(&added, None, false).unwrap(),
+            ubuntu_bashrc
+        );
+
+        let legacy_bottom = format!("{ubuntu_bashrc}{SHELL_BEGIN}\nold\n{SHELL_END}\n");
+        let migrated = rewrite_shell_block_at(&legacy_bottom, Some(&block), true).unwrap();
+        assert_eq!(migrated, added);
+
+        let with_shebang = format!("#!/bin/bash\n{ubuntu_bashrc}");
+        let shebang_added = rewrite_shell_block_at(&with_shebang, Some(&block), true).unwrap();
+        assert!(shebang_added.starts_with(&format!("#!/bin/bash\n{block}")));
+        assert_eq!(
+            rewrite_shell_block_at(&shebang_added, None, false).unwrap(),
+            with_shebang
+        );
     }
 
     /// The user's own `http.proxy` is read as intent: set means set, empty or

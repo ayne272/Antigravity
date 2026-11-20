@@ -1141,9 +1141,19 @@ fn read_own_proxy() -> State {
 
 /// The kinds, in the order the window lists them. VS Code is the Antigravity
 /// extension's backend in `~/.gemini/bin` (`install_label`).
-const INSTALL_KINDS: [&str; 4] = [
+#[cfg(target_os = "windows")]
+const INSTALL_KINDS: &[&str] = &[
     "Antigravity 2.0",
     "Antigravity IDE",
+    "Antigravity CLI",
+    "Antigravity для VS Code",
+];
+
+#[cfg(not(target_os = "windows"))]
+const INSTALL_KINDS: &[&str] = &[
+    "Antigravity 2.0",
+    "Antigravity IDE",
+    "Antigravity Remote-SSH",
     "Antigravity CLI",
     "Antigravity для VS Code",
 ];
@@ -1167,7 +1177,7 @@ fn collect_installs(
     }
 
     let mut rows: Vec<InstallRow> = Vec::new();
-    for label in INSTALL_KINDS {
+    for &label in INSTALL_KINDS {
         let hit = chosen
             .iter()
             .find(|(p, _)| crate::install_label(p) == label)
@@ -1596,6 +1606,7 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
     ctx.proxy_var_retryable = false;
 
     let mut ok = 0usize;
+    let mut patched_remote = false;
     for inst in &targets {
         // A root-owned Linux install: only this write is done as root, behind
         // the desktop's password prompt (`elevate`).
@@ -1608,6 +1619,9 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
             match crate::elevate::patch_as_root(inst) {
                 Ok(done) => {
                     ok += 1;
+                    if crate::is_remote_server_install(inst) {
+                        patched_remote = true;
+                    }
                     if done.proxy_var {
                         ctx.proxy_var_carried = Some(true);
                     }
@@ -1626,6 +1640,9 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
         match crate::process_install(inst) {
             Ok(outcome) => {
                 ok += 1;
+                if crate::is_remote_server_install(inst) {
+                    patched_remote = true;
+                }
                 if outcome.summary.proxy_var > 0 {
                     ctx.proxy_var_carried = Some(true);
                 }
@@ -1665,6 +1682,12 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
     crate::remove_legacy_ca_quiet();
 
     ctx.log(Level::Ok, format!("Пропатчено установок: {}", ok));
+    if patched_remote {
+        ctx.log(
+            Level::Info,
+            "Для Remote-SSH: переподключите SSH-окно (или «Kill Server on Host»), чтобы сервер запустился с AG_LS_PROXY.",
+        );
+    }
     true
 }
 

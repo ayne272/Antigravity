@@ -78,6 +78,51 @@ pub fn clean_input_path(input: &str) -> String {
     s.to_string()
 }
 
+fn has_antigravity_server_bin(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let p = e.path();
+        p.is_file()
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("antigravity-server"))
+    })
+}
+
+fn remote_server_has_payload(path: &Path) -> bool {
+    if patch_binary::has_remote_binaries(path) {
+        return true;
+    }
+    patch_binary::remote_server_dirs(path).into_iter().any(|srv| {
+        srv.join("out").join("server-main.js").is_file()
+            || has_antigravity_server_bin(&srv.join("bin"))
+            || srv.join("extensions").join("antigravity").is_dir()
+            || srv.join("extensions").join("agy").is_dir()
+    })
+}
+
+/// True when `path` is either a single Remote-SSH server commit directory or
+/// the `~/.antigravity-server` container holding downloaded commits.
+pub fn is_remote_server_install(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    if path.join("out").join("server-main.js").is_file()
+        || path.join("bin").join("antigravity-server").is_file()
+        || path.join("bin").join("antigravity-server-insiders").is_file()
+        || path.join("extensions").join("antigravity").is_dir()
+    {
+        return true;
+    }
+    let is_container = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        let low = n.to_ascii_lowercase();
+        low.starts_with(".antigravity-server") || low == "antigravity-server"
+    });
+    is_container && remote_server_has_payload(path)
+}
+
 fn is_install_root(path: &Path) -> bool {
     if !path.exists() || !path.is_dir() {
         return false;
@@ -90,6 +135,10 @@ fn is_install_root(path: &Path) -> bool {
         || path_str.contains("\\windows\\syswow64")
     {
         return false;
+    }
+
+    if is_remote_server_install(path) {
+        return true;
     }
 
     #[cfg(target_os = "macos")]
@@ -148,7 +197,7 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
     }
 
     let mut current = p.clone();
-    for _ in 0..4 {
+    for _ in 0..6 {
         if let Some(parent) = current.parent() {
             if is_install_root(parent) {
                 return Some(parent.to_path_buf());
@@ -163,6 +212,8 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
         "Antigravity IDE",
         "Antigravity",
         "agy",
+        ".antigravity-server",
+        ".antigravity-server-insiders",
         "Programs\\Antigravity IDE",
         "Programs\\Antigravity",
         "resources",
@@ -248,6 +299,8 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".agy"));
         v.push(h.join(".local/share/agy/bin"));
         v.push(h.join(".gemini/bin"));
+        v.push(h.join(".antigravity-server"));
+        v.push(h.join(".antigravity-server-insiders"));
     }
     // macOS: `.app` bundles in /Applications and ~/Applications; the install
     // root is the bundle's `Contents` (S80).
@@ -522,6 +575,16 @@ pub fn process_install(install: &Path) -> Result<InstallOutcome, String> {
             warnings,
             summary: bin_summary,
         });
+    } else if is_remote_server_install(install) {
+        warnings.extend(patch_ide::patch_remote_server_env(install));
+        if bin_summary.ok == 0 {
+            return Err(binary_failure_message(&bin_summary));
+        }
+        return Ok(InstallOutcome {
+            label: install_label(install),
+            warnings,
+            summary: bin_summary,
+        });
     }
 
     Err("Компоненты приложения не найдены".to_string())
@@ -606,6 +669,8 @@ fn is_gemini_bin(install: &Path) -> bool {
 pub fn install_label(install: &Path) -> &'static str {
     if is_gemini_bin(install) && vscode_extension_installed() {
         "Antigravity для VS Code"
+    } else if is_remote_server_install(install) {
+        "Antigravity Remote-SSH"
     } else if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
@@ -749,5 +814,40 @@ mod tests {
         fs::write(base.join("agy"), b"binary").unwrap();
         assert!(is_install_root(&base));
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn remote_server_container_and_deep_binary_resolve_correctly() {
+        let base = env::temp_dir().join(format!("ag_remote_root_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+
+        let empty_server = base.join(".antigravity-server");
+        fs::create_dir_all(&empty_server).unwrap();
+        assert!(
+            !is_remote_server_install(&empty_server),
+            "empty .antigravity-server without payload must not be an install"
+        );
+        assert!(!is_install_root(&empty_server));
+
+        let ls = empty_server
+            .join("bin")
+            .join("commit123")
+            .join("extensions")
+            .join("antigravity")
+            .join("bin")
+            .join("language_server_linux_x64");
+        fs::create_dir_all(ls.parent().unwrap()).unwrap();
+        fs::write(&ls, b"binary").unwrap();
+
+        assert!(is_remote_server_install(&empty_server));
+        assert!(is_install_root(&empty_server));
+        assert_eq!(install_label(&empty_server), "Antigravity Remote-SSH");
+
+        let commit_dir = empty_server.join("bin").join("commit123");
+        assert!(is_remote_server_install(&commit_dir));
+        assert_eq!(resolve_install_root(&ls), Some(commit_dir));
+        assert_eq!(resolve_install_root(&empty_server), Some(empty_server.clone()));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

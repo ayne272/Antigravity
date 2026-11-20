@@ -382,7 +382,8 @@ fn inspect(target: &Path, st: &mut FileState) {
             // `kill_holder` closes processes by image name, so it only means
             // anything for a native binary; asking Windows to kill `main.js`
             // would be a wasted spawn.
-            let is_native = target.extension().and_then(|e| e.to_str()) != Some("js");
+            let is_native = target.extension().and_then(|e| e.to_str()) != Some("js")
+                && !patch_ide::is_remote_env_target(target);
 
             if !is_native || !looks_locked {
                 return;
@@ -419,10 +420,12 @@ fn inspect(target: &Path, st: &mut FileState) {
     }
 }
 
-/// Picks the right patch for a target by kind: the IDE's `main.js` gets the JS
-/// patch, everything else is a native binary.
+/// Picks the right patch for a target by kind: Remote-SSH env hooks first,
+/// then the IDE's `main.js`, and everything else is a native binary.
 fn repatch(target: &Path) -> RepatchOutcome {
-    if target.extension().and_then(|e| e.to_str()) == Some("js") {
+    if patch_ide::is_remote_env_target(target) {
+        patch_ide::repatch_remote_env_file(target)
+    } else if target.extension().and_then(|e| e.to_str()) == Some("js") {
         patch_ide::repatch_ide_js(target)
     } else {
         patch_binary::repatch_if_needed(target)
@@ -430,9 +433,9 @@ fn repatch(target: &Path) -> RepatchOutcome {
 }
 
 /// Every file this watcher keeps patched for one install: the native binaries,
-/// plus the IDE `main.js` when present. Desktop 2.4+ carries no auth JS (it is
-/// all in the Language Server) and its `dist/main.js` is deliberately not
-/// touched; only the IDE's `out/main.js` is.
+/// plus the IDE `main.js` when present and Remote-SSH env targets. Desktop 2.4+
+/// carries no auth JS (it is all in the Language Server) and its `dist/main.js`
+/// is deliberately not touched; only the IDE's `out/main.js` is.
 fn targets(inst: &Path) -> Vec<PathBuf> {
     let mut list = patch_binary::binary_targets(inst);
     let ide_js = inst
@@ -442,6 +445,11 @@ fn targets(inst: &Path) -> Vec<PathBuf> {
         .join("main.js");
     if ide_js.exists() {
         list.push(ide_js);
+    }
+    for env_target in patch_ide::remote_env_targets(inst) {
+        if !list.contains(&env_target) {
+            list.push(env_target);
+        }
     }
     list
 }
