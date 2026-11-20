@@ -1,7 +1,7 @@
 # Antigravity Unlocker - terminal mode in one command (Windows 10/11):
 #
-#   PowerShell:  irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex
-#   cmd:         powershell -NoProfile -c "irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex"
+#   PowerShell:  irm https://github.com/ayne272/Antigravity/releases/latest/download/tui.ps1 | iex
+#   cmd:         powershell -NoProfile -c "irm https://github.com/ayne272/Antigravity/releases/latest/download/tui.ps1 | iex"
 #
 # Fetches the latest release from GitHub into %LOCALAPPDATA%\AGUnlocker\AG.exe and
 # runs it right in this console. Running the same command again downloads only
@@ -23,7 +23,7 @@
     [Net.ServicePointManager]::SecurityProtocol =
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-    $repo = 'confeden/Antigravity'
+    $repo = if ($env:AG_REPO) { $env:AG_REPO } else { 'ayne272/Antigravity' }
     $dir = Join-Path $env:LOCALAPPDATA 'AGUnlocker'
     $exe = Join-Path $dir 'AG.exe'
     $stamp = "$exe.version"
@@ -38,11 +38,12 @@
         $tag = $uri.AbsoluteUri.TrimEnd('/').Split('/')[-1]
     } catch {}
     $ver = if ($tag) { $tag.TrimStart('v') } else { '' }
+    $stampVal = "$repo@$ver"
 
     if ($ver -notmatch '^[0-9._]+$') {
         if (-not (Test-Path $exe)) { throw "Could not find the latest version on github.com/$repo." }
         Write-Host 'GitHub did not answer - starting the copy downloaded before.'
-    } elseif (-not (Test-Path $exe) -or (Get-Content $stamp -ErrorAction SilentlyContinue) -ne $ver) {
+    } elseif (($env:AG_FORCE_UPDATE -eq '1') -or (-not (Test-Path $exe)) -or ((Get-Content $stamp -ErrorAction SilentlyContinue) -ne $stampVal)) {
         Write-Host "Downloading Antigravity Unlocker $ver ..."
         New-Item -ItemType Directory -Force $dir | Out-Null
         # The tag spells a fourth number with a dot (v2.24.0.1), the asset with an
@@ -59,7 +60,7 @@
         if (-not $got) { throw "No AG_$ver.exe in release $tag." }
         try {
             Move-Item -Force "$exe.part" $exe
-            Set-Content -Path $stamp -Value $ver
+            Set-Content -Path $stamp -Value $stampVal
         } catch {
             # The old copy is running (another window of it): it cannot be
             # replaced now, but it can still be started.

@@ -260,13 +260,14 @@ fn antigravity_card(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         bypass_master(app, ui);
 
-        // The group proxy is a way of its own: it can be the only one on, so the
-        // row is always there.
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(8.0);
-        cap_row(app, ui, Cap::GroupProxy);
-        group_proxy_field(app, ui);
+        // The group proxy is only shown when built with `.group`.
+        if cfg!(group) {
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            cap_row(app, ui, Cap::GroupProxy);
+            group_proxy_field(app, ui);
+        }
 
         ui.add_space(10.0);
         ui.separator();

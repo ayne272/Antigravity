@@ -255,7 +255,11 @@ impl Status {
 pub fn bypass_order(on: bool) -> Vec<Cap> {
     if on {
         // The user's own proxy is theirs to switch on: it needs an address.
-        vec![Cap::Dns, Cap::LocalProxy, Cap::GroupProxy]
+        if cfg!(group) {
+            vec![Cap::Dns, Cap::LocalProxy, Cap::GroupProxy]
+        } else {
+            vec![Cap::Dns, Cap::LocalProxy]
+        }
     } else {
         vec![Cap::LocalProxy, Cap::OwnProxy, Cap::GroupProxy, Cap::Dns]
     }
@@ -281,12 +285,8 @@ pub enum Event {
 
 /// UI → worker.
 pub enum Cmd {
-    /// The key was accepted and the main screen is up. Auto-patch may act from
-    /// here on, never before: the first scan runs under the licence screen, and
-    /// patching from there would hand the patch to anyone without a key.
+    /// The window is open on the main screen. Auto-patch may run from here on.
     Unlocked,
-    /// Store the licence key just accepted, so the next start skips the screen.
-    RememberLicense(String),
     /// Ask the system again where the client's traffic leaves.
     ///
     /// Its own command because it is the one measurement that goes stale on its
@@ -469,12 +469,6 @@ fn run_worker(
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Stop => return,
-            Cmd::RememberLicense(key) => {
-                if ctx.settings.license_key != key {
-                    ctx.settings.license_key = key;
-                    ctx.settings.save();
-                }
-            }
             Cmd::Unlocked => {
                 // The first snapshot was taken while the licence screen was up;
                 // a fresh one either way, deep when auto-patch just wrote.

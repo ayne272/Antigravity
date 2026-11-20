@@ -169,6 +169,7 @@ fn main() {
         bake_secret("exits_gen.rs", "EXITS", &exit_list);
     }
 
+    println!("cargo::rustc-check-cfg=cfg(group)");
     println!("cargo:rerun-if-changed=.group");
     let group = if Path::new(".group").exists() {
         let list = fs::read_to_string(".group").expect("read .group");
@@ -184,6 +185,9 @@ fn main() {
         bake_secret("group_gen.rs", "GROUP", "");
         false
     };
+    if group {
+        println!("cargo:rustc-cfg=group");
+    }
 
     // Which private routes this build actually got. Printed because the failure
     // mode is silent: a release built with one of the files missing works fine

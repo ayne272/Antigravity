@@ -42,9 +42,9 @@ pub struct Settings {
     #[serde(default)]
     pub group_key: String,
 
-    /// The licence key this machine last had accepted. Kept so a restart or an
-    /// `_N` update starts straight on the main screen; a key for another 3-digit
-    /// version fails `auth::verify_key` and the licence screen comes back.
+    /// Legacy licence key field retained for backwards-compatible settings.json
+    /// deserialization; key gating has been removed.
+    #[allow(dead_code)]
     #[serde(default)]
     pub license_key: String,
 
