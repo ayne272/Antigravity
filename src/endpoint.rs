@@ -495,8 +495,10 @@ fn rewrite_shell_block(text: &str, block: Option<&str>) -> Option<String> {
 }
 
 /// Shell files that reach what `environment.d` does not: `~/.profile` (lightdm
-/// and login shells), `~/.bashrc` (prepended before interactive-only early
-/// returns so SSH non-interactive bash still sees it), and `~/.zshenv` for zsh.
+/// and login shells), `~/.bash_profile` (if present, read by bash login
+/// shells instead of `~/.profile`), `~/.bashrc` (prepended before
+/// interactive-only early returns so SSH non-interactive bash still sees it),
+/// and `~/.zshenv` for zsh.
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn shell_files(home: &Path) -> Vec<(PathBuf, bool, bool)> {
     let zsh_present = home.join(".zshenv").exists()
@@ -504,20 +506,17 @@ fn shell_files(home: &Path) -> Vec<(PathBuf, bool, bool)> {
         || std::env::var("SHELL").is_ok_and(|s| s.ends_with("/zsh") || s == "zsh");
     vec![
         (home.join(".profile"), true, false),
+        (home.join(".bash_profile"), false, false),
         (home.join(".bashrc"), false, true),
         (home.join(".zshenv"), zsh_present, false),
     ]
 }
 
-/// True when any file was changed.
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-fn ensure_shell_hooks(conf: &Path) -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return false;
-    };
+fn ensure_shell_hooks_in(home: &Path, conf: &Path) -> bool {
     let block = shell_block(conf);
     let mut changed = false;
-    for (file, create, prepend) in shell_files(&home) {
+    for (file, create, prepend) in shell_files(home) {
         let text = match fs::read_to_string(&file) {
             Ok(t) => t,
             Err(_) if create && !file.exists() => String::new(),
@@ -528,6 +527,15 @@ fn ensure_shell_hooks(conf: &Path) -> bool {
         }
     }
     changed
+}
+
+/// True when any file was changed.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn ensure_shell_hooks(conf: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    ensure_shell_hooks_in(&home, conf)
 }
 
 /// Takes our block back out of the shell files (revert).
@@ -1146,6 +1154,36 @@ mod tests {
             rewrite_shell_block_at(&shebang_added, None, false).unwrap(),
             with_shebang
         );
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[test]
+    fn bash_profile_hook_updates_only_when_present() {
+        let root = std::env::temp_dir().join(format!("ag_bash_profile_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let conf = root.join(".config").join("environment.d").join("ag-unlocker.conf");
+
+        let files = shell_files(&root);
+        let bp_entry = files
+            .iter()
+            .find(|(p, _, _)| p.file_name().is_some_and(|n| n == ".bash_profile"))
+            .expect(".bash_profile entry missing");
+        assert!(!bp_entry.1, ".bash_profile must have create = false");
+
+        assert!(ensure_shell_hooks_in(&root, &conf));
+        assert!(
+            !root.join(".bash_profile").exists(),
+            ".bash_profile must not be created when absent"
+        );
+        assert!(root.join(".profile").exists());
+
+        fs::write(root.join(".bash_profile"), "[[ -f ~/.bashrc ]] && . ~/.bashrc\n").unwrap();
+        assert!(ensure_shell_hooks_in(&root, &conf));
+        let bp = fs::read_to_string(root.join(".bash_profile")).unwrap();
+        assert!(bp.contains(SHELL_BEGIN), ".bash_profile missing hook: {}", bp);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The user's own `http.proxy` is read as intent: set means set, empty or

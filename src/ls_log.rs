@@ -459,6 +459,12 @@ fn remote_server_logs_in(home: &Path) -> Vec<PathBuf> {
             list.push(p);
         }
     };
+    let hub_data = home.join(".antigravity-hub-server").join("data");
+    if let Some(p) = newest_log_in(&hub_data, |low| {
+        low.starts_with("ls-") || low.contains("language_server")
+    }) {
+        push_unique(&mut out, p);
+    }
     for dir_name in [".antigravity-server", ".antigravity-server-insiders"] {
         let logs = home.join(dir_name).join("data").join("logs");
         let direct = logs.join("language_server.log");
@@ -1804,6 +1810,33 @@ API Error: {Reason:UNSUPPORTED_LOCATION}
         assert!(found.contains(&new_main), "missing ls-main.log: {:?}", found);
         assert!(found.contains(&ext_log), "missing exthost Antigravity.log: {:?}", found);
         assert!(!found.contains(&old_main), "old session should not be picked: {:?}", found);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovers_hub_remote_server_log() {
+        let root = std::env::temp_dir().join(format!("ag_hub_remote_logs_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let data = root.join(".antigravity-hub-server").join("data");
+        fs::create_dir_all(&data).unwrap();
+
+        let old_log = data.join("ls-2.32.2.log");
+        let rotated = data.join("ls-2.33.0.log.1");
+        let hub_log = data.join("ls-2.33.0.log");
+        fs::write(&old_log, b"old\n").unwrap();
+        let past = std::time::SystemTime::now() - Duration::from_secs(60);
+        if let Ok(f) = fs::File::options().write(true).open(&old_log) {
+            let _ = f.set_modified(past);
+        }
+        fs::write(&rotated, b"rotated\n").unwrap();
+        fs::write(&hub_log, b"current\n").unwrap();
+
+        let found = remote_server_logs_in(&root);
+        assert!(found.contains(&hub_log), "missing hub log: {:?}", found);
+        assert!(!found.contains(&old_log), "old hub log should not be picked: {:?}", found);
+        assert!(!found.contains(&rotated), "rotated log must be ignored: {:?}", found);
 
         let _ = fs::remove_dir_all(&root);
     }

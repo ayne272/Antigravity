@@ -118,7 +118,10 @@ pub fn is_remote_server_install(path: &Path) -> bool {
     }
     let is_container = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
         let low = n.to_ascii_lowercase();
-        low.starts_with(".antigravity-server") || low == "antigravity-server"
+        low.starts_with(".antigravity-hub-server")
+            || low == "antigravity-hub-server"
+            || low.starts_with(".antigravity-server")
+            || low == "antigravity-server"
     });
     is_container && remote_server_has_payload(path)
 }
@@ -212,6 +215,7 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
         "Antigravity IDE",
         "Antigravity",
         "agy",
+        ".antigravity-hub-server",
         ".antigravity-server",
         ".antigravity-server-insiders",
         "Programs\\Antigravity IDE",
@@ -299,6 +303,7 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".agy"));
         v.push(h.join(".local/share/agy/bin"));
         v.push(h.join(".gemini/bin"));
+        v.push(h.join(".antigravity-hub-server"));
         v.push(h.join(".antigravity-server"));
         v.push(h.join(".antigravity-server-insiders"));
     }
@@ -847,6 +852,32 @@ mod tests {
         assert!(is_remote_server_install(&commit_dir));
         assert_eq!(resolve_install_root(&ls), Some(commit_dir));
         assert_eq!(resolve_install_root(&empty_server), Some(empty_server.clone()));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hub_remote_server_container_and_binary_resolve_correctly() {
+        let base = env::temp_dir().join(format!("ag_hub_remote_root_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+
+        let hub_root = base.join(".antigravity-hub-server");
+        fs::create_dir_all(&hub_root).unwrap();
+        assert!(
+            !is_remote_server_install(&hub_root),
+            "empty .antigravity-hub-server without payload must not be an install"
+        );
+        assert!(!is_install_root(&hub_root));
+
+        let ls = hub_root.join("bin").join("2.33.0-x64").join("language_server");
+        fs::create_dir_all(ls.parent().unwrap()).unwrap();
+        fs::write(&ls, b"binary").unwrap();
+
+        assert!(is_remote_server_install(&hub_root));
+        assert!(is_install_root(&hub_root));
+        assert_eq!(install_label(&hub_root), "Antigravity Remote-SSH");
+        assert_eq!(resolve_install_root(&ls), Some(hub_root.clone()));
+        assert_eq!(resolve_install_root(&base), Some(hub_root));
 
         let _ = fs::remove_dir_all(&base);
     }

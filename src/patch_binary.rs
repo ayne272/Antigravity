@@ -740,6 +740,7 @@ pub fn remote_server_dirs(inst: &Path) -> Vec<PathBuf> {
 
 fn collect_remote_binaries(inst: &Path, targets: &mut Vec<PathBuf>) {
     for srv in remote_server_dirs(inst) {
+        push_ls_in_dir(&srv, targets);
         push_ls_in_dir(&srv.join("extensions").join("antigravity").join("bin"), targets);
         push_ls_in_dir(&srv.join("bin"), targets);
         push_ls_in_dir(&srv.join("resources").join("bin"), targets);
@@ -1697,6 +1698,52 @@ mod owner_app_tests {
         }
         assert_eq!(fs::read(&ls1).unwrap(), b"..ineligible..https_proxy..");
         assert_eq!(fs::read(&ls2).unwrap(), b"..ineligible..https_proxy..");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hub_remote_server_binary_targets_patch_and_unpatch() {
+        let root = std::env::temp_dir().join(format!("ag_hub_remote_bins_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let hub_root = root.join(".antigravity-hub-server");
+        let ver_dir = hub_root.join("bin").join("2.33.0-x64");
+        fs::create_dir_all(&ver_dir).unwrap();
+
+        let ls = ver_dir.join("language_server");
+        fs::write(&ls, b"..ineligible..https_proxy..").unwrap();
+        let partial = ver_dir.join(".partial.123");
+        fs::write(&partial, b"downloading").unwrap();
+        let tmp_file = ver_dir.join("language_server.999.agtmp");
+        fs::write(&tmp_file, b"partial").unwrap();
+
+        let found = binary_targets(&hub_root);
+        let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let found_canon: Vec<PathBuf> = found.iter().map(|p| canon(p)).collect();
+        assert!(found_canon.contains(&canon(&ls)), "missing ls: {:?}", found);
+        assert!(
+            !found_canon.contains(&canon(&partial)),
+            ".partial must be ignored: {:?}",
+            found
+        );
+        assert!(
+            !found_canon.contains(&canon(&tmp_file)),
+            "agtmp must be ignored: {:?}",
+            found
+        );
+
+        let summary = patch_all_binaries(&hub_root);
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.proxy_var, 1);
+        assert_eq!(fs::read(&ls).unwrap(), b"..inexigible..AG_LS_PROXY..");
+        assert!(inspect_install(&hub_root).fully_patched());
+
+        for (_, res) in unpatch_all_binaries(&hub_root) {
+            assert!(res.is_ok());
+        }
+        assert_eq!(fs::read(&ls).unwrap(), b"..ineligible..https_proxy..");
+        assert!(!inspect_install(&hub_root).fully_patched());
 
         let _ = fs::remove_dir_all(&root);
     }
